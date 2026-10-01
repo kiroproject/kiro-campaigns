@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Campaigns Preview</title>
+<style>
+  :root{--bg:#161a22;--text:#eef1f6;--muted:#8b93a3;--accent:#7c5cff;--border:#2b3140;--radius:12px;--panel:#1c212b;--panel-2:#232a36}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:1400px;margin:0 auto;padding:16px}
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+<script type="module">
+  // In-memory imitation of the admin API, enough to exercise the whole UI.
+  const data = await (await fetch("./meta.json")).json();
+  const meta = { ...data.meta };
+  let settings = { engine_enabled: false, tz_offset_hours: 3, quiet_enabled: true, quiet_from: 22, quiet_to: 10, daily_cap: 2, min_gap_hours: 12, rate_per_second: 20, attribution_days: 7, cooldown_days: 14, respect_marketing_preference: true, max_defer_hours: 48 };
+  meta.settings = settings;
+  const clone = (v) => JSON.parse(JSON.stringify(v));
+  let nextId = 3;
+  const store = new Map();
+  const mk = (id, name, status, graph, live) => store.set(id, { id, name, status, graph, live_version: live, options: { exit_on_payment: true }, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), started_at: null });
+  mk(1, "3 дня после окончания: скидка 10%", "active", clone(data.graphs.after_end_3), 2);
+  mk(2, "Рассылка: акция выходного дня", "draft", clone(data.blank), 0);
+  const live = new Map([[1, clone(data.graphs.after_end_3)]]);
+  const issuesOf = (g) => {
+    const out = [];
+    if (!g.nodes.some((n) => n.type.startsWith("trg_"))) out.push({ level: "error", node_id: "", code: "trigger_count", message: "В кампании должен быть ровно один блок-триггер" });
+    g.nodes.filter((n) => n.type === "send_message" && !Object.keys(n.params.texts || {}).length).forEach((n) => out.push({ level: "error", node_id: n.id, code: "empty_text", message: "Не заполнен текст сообщения" }));
+    return out;
+  };
+  const json = (body, status = 200) => new Response(JSON.stringify({ ok: status < 400, ...body }), { status, headers: { "Content-Type": "application/json" } });
+  const series = (c) => Array.from({ length: 31 }, (_, i) => ({ day: new Date(Date.now() - (30 - i) * 864e5).toISOString().slice(0, 10), revenue: Math.round((Math.sin(i / 3) + 1.4) * 1800 * (c === "RUB" ? 1 : 0.02)), payments: 4 + (i % 5) }));
+  const realFetch = window.fetch.bind(window);
+  window.__calls = [];
+  window.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    if (!u.startsWith("/api/admin/kiro-campaigns")) return realFetch(url, opts);
+    const path = u.replace("/api/admin/kiro-campaigns", "").split("?")[0];
+    const method = (opts.method || "GET").toUpperCase();
+    const body = opts.body ? JSON.parse(opts.body) : {};
+    window.__calls.push(method + " " + path);
+    await new Promise((r) => setTimeout(r, 60));
+    let m;
+    if (path === "/meta") return json(meta);
+    if (path === "/settings") { if (method === "PUT") settings = { ...settings, ...body }; return json({ settings }); }
+    if (path === "/campaigns" && method === "GET") {
+      const items = [...store.values()].map((c) => ({ id: c.id, name: c.name, status: c.status, live_version: c.live_version, nodes: c.graph.nodes.length, trigger: (c.graph.nodes.find((n) => n.type.startsWith("trg_")) || {}).type,
+        stats: c.id === 1 ? { entered: 412, active: 38, sent: 360, reached: 330, converted: 41, rate: 12.42, revenue: { RUB: 24600, USD: 12 }, holdout: 40 } : {} }));
+      return json({ campaigns: items.reverse(), engine_enabled: settings.engine_enabled, window_days: 7 });
+    }
+    if (path === "/campaigns" && method === "POST") {
+      const id = nextId++;
+      const preset = body.preset ? data.graphs[body.preset] : data.blank;
+      mk(id, body.preset ? meta.presets.find((p) => p.id === body.preset).title : "Новая кампания", "draft", clone(preset), 0);
+      return json({ id });
+    }
+    if ((m = path.match(/^\/campaigns\/(\d+)$/))) {
+      const c = store.get(Number(m[1]));
+      if (method === "GET") return json({ campaign: { ...c, live_graph: live.get(c.id) || null, unpublished: JSON.stringify(live.get(c.id) || null) !== JSON.stringify(c.graph), issues: issuesOf(c.graph) } });
+      if (method === "PUT") { if (body.graph) c.graph = body.graph; if (body.name) c.name = body.name; if (body.options) c.options = body.options; return json({ issues: issuesOf(c.graph) }); }
+      if (method === "DELETE") { store.delete(c.id); return json({}); }
+    }
+    if ((m = path.match(/^\/campaigns\/(\d+)\/(\w+(-\w+)?)$/))) {
+      const c = store.get(Number(m[1]));
+      const action = m[2];
+      if (action === "publish") { const issues = issuesOf(c.graph); if (issues.some((i) => i.level === "error")) return json({ error: "graph_invalid", issues }, 400); c.live_version += 1; live.set(c.id, clone(c.graph)); return json({ version: c.live_version, issues }); }
+      if (action === "dry-run") return json({ count: 1284, sample: [101, 205, 318, 412, 520], scheduled: false });
+      if (action === "simulate") return json({ user_id: 1, path: [{ node_id: c.graph.nodes[0].id, result: "start" }, ...c.graph.nodes.slice(1, 4).map((n) => ({ node_id: n.id, result: "out" }))] });
+      if (action === "test") return json({});
+      if (action === "exclude") return json({ removed: 1 });
+      if (action === "report") return json({ report: { window_days: 7, funnel: { entered: 412, active: 38, done: 300, exited: 70, error: 4, holdout: 40 }, delivery: { sent: 360, failed: 6, skipped: 12, promo: 330 },
+        treated: { n: 330, converted: 41, rate: 12.42, revenue: { RUB: 24600, USD: 12 }, arpu: { RUB: 74.55 } }, control: { n: 40, converted: 2, rate: 5, revenue: { RUB: 900 }, arpu: { RUB: 22.5 } }, uplift_pp: 7.42,
+        promo: { issued: 330, activated: 44, payments: 38, revenue: { RUB: 21900 } }, goals: { "Вернулся": 41 },
+        nodes: Object.fromEntries(c.graph.nodes.map((n, i) => [n.id, { visit: Math.max(10, 412 - i * 50), sent: n.type === "send_message" ? 360 : undefined, payments: n.type === "send_message" ? 38 : undefined, revenue: n.type === "send_message" ? { RUB: 21900 } : undefined }])) } });
+      if (action === "journal") return json({ events: [{ id: 3, user_id: 4821, username: "ivan", node_id: "m", node_type: "send_message", kind: "sent", detail: { message_id: 981 }, created_at: new Date().toISOString() }, { id: 2, user_id: 977, node_id: "p", kind: "promo", detail: { code: "K3F9AQ", kind: "discount", value: 10 }, created_at: new Date().toISOString() }] });
+      if (["start", "pause", "resume", "stop", "archive", "restore"].includes(action)) { c.status = { start: "active", pause: "paused", resume: "active", stop: "finished", archive: "archived", restore: "draft" }[action]; return json({ status: c.status, engine_enabled: settings.engine_enabled }); }
+      if (action === "duplicate") { const id = nextId++; mk(id, c.name + " (копия)", "draft", clone(c.graph), 0); return json({ id }); }
+    }
+    if (path === "/analytics") return json({ analytics: { days: 30, currencies: ["RUB", "USD"], series: { RUB: series("RUB"), USD: series("USD") },
+      totals: { RUB: { revenue: 182400, payments: 96, payers: 71, avg_check: 1900 }, USD: { revenue: 410, payments: 9, payers: 8, avg_check: 45.5 } }, payers: { all: 79, new: 31, repeat: 48 },
+      trial: { started: 120, paid: 34, rate: 28.33 }, subscriptions: { lost: 52, active: 640 }, tariffs: [{ tariff: "start", currency: "RUB", payments: 60, revenue: 90000 }, { tariff: "premium", currency: "RUB", payments: 36, revenue: 92400 }],
+      campaign_share: { RUB: { revenue: 21900, total: 182400, share: 12.01 }, USD: { revenue: 0, total: 410, share: 0 } } } });
+    if (path === "/images") return json({ image_id: "img1", url: "/x" });
+    if (path === "/engine/tick") return json({ stats: { entered: 0, processed: 0, sent: 0 } });
+    return json({ error: "not_found" }, 404);
+  };
+  const mod = await import("../frontend/admin/index.js?" + Date.now());
+  window.__mod = mod;
+  window.__inst = mod.mountView(new URLSearchParams(location.search).get("v") || "main", document.getElementById("app"), {});
+</script>
+</body>
+</html>
